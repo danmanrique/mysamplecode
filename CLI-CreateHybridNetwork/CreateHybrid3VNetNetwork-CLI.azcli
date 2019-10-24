@@ -1,0 +1,113 @@
+﻿#pre-reqs
+az extension add -n azure-firewall
+
+#login
+az login
+
+#select subscription
+az account set --subscription "PUT YOUR GUID HERE"
+
+#create Resource Group
+az group create --name FW-Hybrid-Test --location eastus
+
+#create hub vnet
+az network vnet create --name VNet-Hub --resource-group FW-Hybrid-Test --location eastus --address-prefix 10.5.0.0/16 --subnet-name AzureFirewallSubnet --subnet-prefix 10.5.0.0/26
+az network vnet subnet create --name GatewaySubnet --resource-group FW-Hybrid-Test --vnet-name VNet-Hub --address-prefix 10.5.1.0/24 
+az network vnet subnet create --name ManagementSubnet --resource-group FW-Hybrid-Test --vnet-name VNet-Hub --address-prefix 10.5.2.0/24 
+
+#create spoke vnet and additional subnet
+az network vnet create --name VNet-Spoke --resource-group FW-Hybrid-Test --location eastus --address-prefix 10.6.0.0/16 --subnet-name SN-Workload --subnet-prefix 10.6.0.0/24
+
+#create on-prem vnet and additional subnet
+az network vnet create --name VNet-OnPrem --resource-group FW-Hybrid-Test --location eastus --address-prefix 192.168.0.0/16 --subnet-name SN-Corp --subnet-prefix 192.168.1.0/24
+az network vnet subnet create --name GatewaySubnet --resource-group FW-Hybrid-Test --vnet-name VNet-OnPrem --address-prefix 192.168.2.0/24 
+
+#create a public ip address for the on-premise gateway
+az network public-ip create --name VNet-Onprem-GW-pip --resource-group FW-Hybrid-Test --location eastus --allocation-method Dynamic #--sku basic
+
+#create a public ip address for the firewall
+az network public-ip create --name fw-pip --resource-group FW-Hybrid-Test --location eastus --allocation-method static --sku standard
+
+#create a public ip address for the hub gw
+az network public-ip create --name VNet-hub-GW-pip --resource-group FW-Hybrid-Test --location eastus --allocation-method Dynamic #--sku Standard
+
+#Create the Azure FW
+az network firewall create --name AzFW01 --resource-group FW-Hybrid-Test --location eastus
+az network firewall ip-config create --firewall-name AzFW01 --name FW-config --public-ip-address fw-pip --resource-group FW-Hybrid-Test --vnet-name VNet-hub
+az network firewall update --name AzFW01 --resource-group FW-Hybrid-Test 
+
+#Set up a rule to the spoke from on-prem
+az network firewall network-rule create --collection-name RCNet0101 --destination-addresses 10.6.0.0/16 --destination-ports 80 --firewall-name AzFW01 --name Allow-Web --protocols TCP --resource-group FW-Hybrid-Test --priority 100 --source-addresses 192.168.1.0/24 --action Allow
+az network firewall network-rule create --collection-name RCNet0102 --destination-addresses 10.6.0.0/16 --destination-ports 80,3389 --firewall-name AzFW01 --name Allow-Mgmt-Web --protocols TCP --resource-group FW-Hybrid-Test --priority 200 --source-addresses 10.5.2.0/24 --action Allow
+az network firewall network-rule create --collection-name RCNet0103 --destination-addresses 10.6.0.0/16 --destination-ports * --firewall-name AzFW01 --name Allow-ICMP --protocols ICMP --resource-group FW-Hybrid-Test --priority 300 --source-addresses 192.168.1.0/24 --action Allow
+az network firewall network-rule create --collection-name RCNet0201 --destination-addresses 10.6.0.0/16 --destination-ports 3389 --firewall-name AzFW01 --name Allow-RDP --protocols TCP --resource-group FW-Hybrid-Test --priority 1000 --source-addresses 192.168.1.0/24 --action Allow
+
+#create a vpn gateway hub (to spoke)
+az network vnet-gateway create --name GW-Hub --location eastus --public-ip-address VNet-hub-GW-pip --resource-group FW-Hybrid-Test --vnet VNet-Hub --gateway-type Vpn --sku VpnGw1 --vpn-type RouteBased --no-wait
+
+#create a vpn gateway on-prem (to hub)
+az network vnet-gateway create -n GW-Onprem -l eastus --public-ip-address VNet-Onprem-GW-pip -g FW-Hybrid-Test --vnet VNet-Onprem --gateway-type Vpn --sku VpnGw1 --vpn-type RouteBased --no-wait
+
+#Create the VPN connections
+az network vpn-connection create -g FW-Hybrid-Test -n Hub-to-Onprem --vnet-gateway1 GW-Hub --vnet-gateway2 GW-Onprem --shared-key AzureA1b2C3
+az network vpn-connection create -g FW-Hybrid-Test -n Onprem-to-Hub --vnet-gateway1 GW-Onprem --vnet-gateway2 GW-Hub --shared-key AzureA1b2C3
+
+#Create peerings
+az network vnet peering create -g FW-Hybrid-Test -n HubtoSpoke --vnet-name VNet-Hub --remote-vnet VNet-Spoke --allow-vnet-access --allow-gateway-transit
+az network vnet peering create -g FW-Hybrid-Test -n SpoketoHub --vnet-name VNet-Spoke --remote-vnet VNet-Hub --allow-vnet-access --allow-forwarded-traffic --use-remote-gateways
+
+#create route table
+az network route-table create --name UDR-Hub-Spoke --resource-group FW-Hybrid-Test --location eastus
+az network route-table create --name UDR-DG --resource-group FW-Hybrid-Test --disable-bgp-route-propagation true --location eastus
+az network route-table create --name UDR-MGMT-ToSpoke --resource-group FW-Hybrid-Test --disable-bgp-route-propagation true --location eastus
+
+#create route from hub to spoke
+az network route-table route create -g FW-Hybrid-Test --route-table-name UDR-Hub-Spoke -n ToSpoke --next-hop-type VirtualAppliance --address-prefix 10.6.0.0/16 --next-hop-ip-address 10.5.0.4
+#associate the routes
+az network vnet subnet update --vnet-name VNet-Hub --name GatewaySubnet --resource-group FW-Hybrid-Test --route-table UDR-Hub-Spoke
+
+#create route from spoke network
+az network route-table route create -g FW-Hybrid-Test --route-table-name UDR-DG -n ToSpoke --next-hop-type VirtualAppliance --address-prefix 0.0.0.0/0 --next-hop-ip-address 10.5.0.4
+az network route-table route create -g FW-Hybrid-Test --route-table-name UDR-DG -n ToMgmt --next-hop-type VirtualAppliance --address-prefix 10.5.2.0/24 --next-hop-ip-address 10.5.0.4
+#associate the routes
+az network vnet subnet update --vnet-name VNet-Spoke --name SN-Workload --resource-group FW-Hybrid-Test --route-table UDR-DG
+
+#create route from mgmt subnet to spoke
+az network route-table route create -g FW-Hybrid-Test --route-table-name UDR-MGMT-ToSpoke -n MgmtToSpoke --next-hop-type VirtualAppliance --address-prefix 10.6.0.0/16 --next-hop-ip-address 10.5.0.4
+#associate the routes
+az network vnet subnet update --vnet-name VNet-Hub --name ManagementSubnet --resource-group FW-Hybrid-Test --route-table UDR-MGMT-ToSpoke
+
+#create VM for Spoke
+az vm create --resource-group FW-Hybrid-Test --name VM-Spoke-01 --location eastus --image win2016datacenter --public-ip-address '""' --vnet-name VNet-Spoke --subnet SN-Workload --admin-username azureadmin --admin-password Zxcvbnm1234567890
+#Open RDP
+az vm open-port --port 80 --name OpenPort80 --resource-group FW-Hybrid-Test --name VM-Spoke-01 --priority 100
+az vm open-port --port 3389 --name OpenPort3389 --resource-group FW-Hybrid-Test --name VM-Spoke-01 --priority 1000
+
+#create vm from On-Prem
+az vm create --resource-group FW-Hybrid-Test --name VM-Onprem --location eastus --image win2016datacenter --vnet-name VNet-OnPrem --subnet SN-Corp --admin-username azureadmin --admin-password Zxcvbnm1234567890
+#Open RDP
+az vm open-port --port 3389 --name OpenPort3389 --resource-group FW-Hybrid-Test --name VM-Onprem --priority 1000
+
+#create VM for Hub
+az vm create --resource-group FW-Hybrid-Test --name VM-Hub --location eastus --image win2016datacenter --vnet-name VNet-Hub --subnet ManagementSubnet --admin-username azureadmin --admin-password Zxcvbnm1234567890
+#Open RDP
+az vm open-port --port 3389 --name OpenPort3389 --resource-group FW-Hybrid-Test --name VM-Hub --priority 1000
+
+#Install IIS on the work VM
+Set-AzVMExtension -ResourceGroupName FW-Hybrid-Test -ExtensionName IIS -VMName VM-Spoke-01 -Publisher Microsoft.Compute -ExtensionType CustomScriptExtension -TypeHandlerVersion 1.4 -SettingString '{"commandToExecute":"powershell Add-WindowsFeature Web-Server; powershell      Add-Content -Path \"C:\\inetpub\\wwwroot\\Default.htm\" -Value $($env:computername)"}' -Location EastUS
+
+#open outbound traffic to internet from spoke
+az network firewall application-rule create --collection-name App-Rule-01 --firewall-name AzFW01 --name Allow-Outbound --protocols Http=80 Https=443 --resource-group FW-Hybrid-Test --target-fqdns * --source-addresses 10.6.0.0/24 --priority 200 --action Allow
+
+#stop the VMs gracefully
+#az vm stop --ids $(az vm list -g FW-Hybrid-Test --query "[].id" -o tsv)
+
+#set a shutdown schedule for the spoke
+#set a shutdown schedule for the on-prem
+#set a shutdown schedule for the jump server
+
+#Clean Up
+#az group delete -n FW-Hybrid-Test
+
+#start all vms
+#az vm start --ids $(az vm list -g FW-Hybrid-Test --query "[].id" -o tsv)
